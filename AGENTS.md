@@ -5,7 +5,7 @@
 ## TL;DR
 
 - **Goal:** Search a given **hex private-key range** for a Bitcoin **P2PKH** address match.
-- **GPU role:** A WGSL compute shader (**`shaders/seq.wgsl`**) emits sequential **256‑bit** candidates.  
+- **GPU role:** WGSL shaders emit candidates (`shaders/seq.wgsl`) and hash them (`shaders/hash160.wgsl`) to report matches.
   CPU (Rust) derives pubkeys with **libsecp256k1** and compares **HASH160** to the target.
 - **Binary:** `gpu-bitcrack`
 - **Fast start:**
@@ -27,7 +27,8 @@
 gpu-bitcrack/
 ├─ Cargo.toml
 ├─ shaders/
-│  └─ seq.wgsl            # WGSL compute: emits n sequential 256-bit scalars (LE words)
+│  ├─ seq.wgsl            # WGSL compute: emits n sequential 256-bit scalars (LE words)
+│  └─ hash160.wgsl       # WGSL compute: SHA-256+RIPEMD-160 filter
 └─ src/
    └─ main.rs             # CLI, GPU dispatch, CPU verify (secp256k1 -> P2PKH)
 tests/

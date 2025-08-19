@@ -27,7 +27,8 @@
 gpu-bitcrack/
 ├─ Cargo.toml
 ├─ shaders/
-│  └─ seq.wgsl            # WGSL compute: emits n sequential 256-bit scalars (LE words)
+│  ├─ seq.wgsl            # WGSL compute: emits n sequential 256-bit scalars (LE words)
+│  └─ hits.wgsl           # Storage buffer for hit indices written by the GPU
 └─ src/
    └─ main.rs             # CLI, GPU dispatch, CPU verify (secp256k1 -> P2PKH)
 tests/
@@ -54,12 +55,11 @@ tests/
 2. **GPU batch generation**
     - Uniform `Params` includes the 256‑bit `start` (8×`u32`, little‑endian) and `n` (batch size).
     - Kernel writes `n` scalars: `start + idx`, each as 8×`u32` in **little‑endian** limbs.
+    - A small storage buffer (`hits.wgsl`) collects indices of candidates that satisfy the target `HASH160`.
 
 3. **CPU verification**
-    - For each 32‑byte LE scalar: convert to **big‑endian** (libsecp expects BE).
-    - Skip invalid scalars (0 or ≥ curve order).
-    - Derive **compressed pubkey (33B)** → `HASH160` → compare with target.
-    - If any match → print **FOUND** with `address`, `WIF (compressed)`, and `priv_hex`.
+    - After each dispatch only the `hits` buffer is mapped.
+    - For every hit index: reconstruct the full key, derive **compressed pubkey (33B)** → `HASH160`, and print details if it matches.
 
 4. **Iteration**
     - Advance the cursor by `batch`, repeat until end of range; otherwise **Not found**.

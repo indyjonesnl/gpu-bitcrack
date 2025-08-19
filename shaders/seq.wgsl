@@ -59,4 +59,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   outbuf[base + 5u] = s[5];
   outbuf[base + 6u] = s[6];
   outbuf[base + 7u] = s[7];
+
+  // Placeholder: record the first index as a hit for demonstration.
+  if (idx == 0u) {
+    let pos = atomicAdd(&hits.count, 1u);
+    if (pos < MAX_HITS) {
+      hits.idx[pos] = idx;
+    }
+  }
 }

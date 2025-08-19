@@ -4,7 +4,6 @@ use clap::Parser;
 use futures::channel::oneshot;
 use hex::ToHex;
 use pollster::block_on;
-use rayon::prelude::*;
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
@@ -56,124 +55,84 @@ async fn run(args: Args) -> Result<()> {
     // Batch size and GPU init
     let batch = args.batch.max(1);
     let mut gpu = GpuSeq::new(batch).await?;
-
-    // Initial batch setup
     let mut cur = start_words;
     let secp = Secp256k1::new();
-    let mut buf_idx = 0usize;
-    let mut le_bytes = Vec::<u8>::new();
-
-    // Dispatch first batch and wait for it (pipeline warm-up)
-    let (rem, borrow) = sub_u256_le(&end_words, &cur);
-    if borrow != 0 {
-        return Ok(());
-    }
-    let remaining_u64 = low64(&rem).saturating_add(1);
-    if remaining_u64 == 0 {
-        return Ok(());
-    }
-    let first_batch = remaining_u64.min(batch as u64) as u32;
-    let (out_size_bytes, recv) = gpu.dispatch_and_map(cur, first_batch, buf_idx)?;
-    gpu.poll();
-    recv.await.unwrap()?;
-    le_bytes.resize(out_size_bytes as usize, 0);
-    {
-        let slice = gpu.slice(buf_idx, out_size_bytes);
-        let data = slice.get_mapped_range();
-        le_bytes.copy_from_slice(&data);
-    }
-    gpu.unmap(buf_idx);
-    cur = add_small_u256_le(cur, first_batch as u64);
 
     loop {
-        // Compute next batch size
         let (rem, borrow) = sub_u256_le(&end_words, &cur);
         let remaining_u64 = low64(&rem).saturating_add(1);
         if borrow != 0 || remaining_u64 == 0 {
-            if verify_batch(&le_bytes, &secp, &target_h160, args.verbose) {
-                return Ok(());
-            }
             break;
         }
 
-        let next_batch = remaining_u64.min(batch as u64) as u32;
-        let next_idx = 1 - buf_idx;
+        let n = remaining_u64.min(batch as u64) as u32;
+        let (_, out_recv, hits_recv) = gpu.dispatch_and_map(cur, n, 0)?;
 
-        // Dispatch next batch
-        let (next_size, next_recv) = gpu.dispatch_and_map(cur, next_batch, next_idx)?;
-
-        // Verify current batch while GPU works on the next
-        if verify_batch(&le_bytes, &secp, &target_h160, args.verbose) {
-            return Ok(());
-        }
-
-        // Wait for GPU to finish the next batch and read back
         gpu.poll();
-        next_recv.await.unwrap()?;
-        le_bytes.resize(next_size as usize, 0);
-        {
-            let slice = gpu.slice(next_idx, next_size);
-            let data = slice.get_mapped_range();
-            le_bytes.copy_from_slice(&data);
-        }
-        gpu.unmap(next_idx);
+        out_recv.await.unwrap()?;
+        hits_recv.await.unwrap()?;
+        gpu.unmap(0);
 
-        // Advance to next batch
-        cur = add_small_u256_le(cur, next_batch as u64);
-        buf_idx = next_idx;
+        {
+            let slice = gpu.hits_slice();
+            let data = slice.get_mapped_range();
+            let hits: &[u32] = bytemuck::cast_slice(&data);
+            let count = hits[0].min(gpu.max_hits);
+            for i in 0..count as usize {
+                let idx = hits[i + 1];
+                if verify_hit(cur, idx, &secp, &target_h160, args.verbose) {
+                    gpu.unmap_hits();
+                    return Ok(());
+                }
+            }
+        }
+        gpu.unmap_hits();
+        cur = add_small_u256_le(cur, n as u64);
     }
 
     println!("Not found in the given range.");
     Ok(())
 }
 
-fn verify_batch(
-    bytes: &[u8],
+fn verify_hit(
+    start: [u32; 8],
+    idx: u32,
     secp: &Secp256k1<secp256k1::All>,
     target_h160: &[u8; 20],
     verbose: bool,
 ) -> bool {
-    let pos = bytes.par_chunks_exact(32).position_any(|le32| {
-        let mut be = [0u8; 32];
-        for i in 0..32 {
-            be[i] = le32[31 - i];
-        }
-        if be.iter().all(|&b| b == 0) {
-            return false;
-        }
-        let sk = match SecretKey::from_slice(&be) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let pk = PublicKey::from_secret_key(secp, &sk);
-        let pkc = pk.serialize();
-        let h160 = hash160(&pkc);
-        h160 == *target_h160
-    });
-
-    if let Some(p) = pos {
-        let winner_le = &bytes[p * 32..p * 32 + 32];
-        let mut be = [0u8; 32];
-        for i in 0..32 {
-            be[i] = winner_le[31 - i];
-        }
-        let sk = SecretKey::from_slice(&be).expect("valid secret");
-        let pk = PublicKey::from_secret_key(secp, &sk);
-        let pkc = pk.serialize();
-        let address = p2pkh_from_pubkey_compressed(&pkc);
-        let wif = wif_from_secret(&sk);
-
-        println!("FOUND!");
-        println!("address  : {address}");
-        println!("wif      : {wif}");
-        println!("priv_hex : {}", be.encode_hex::<String>());
-        if verbose {
-            println!("pubkey   : {}", pkc.encode_hex::<String>());
-        }
-        true
-    } else {
-        false
+    let candidate = add_small_u256_le(start, idx as u64);
+    let mut le = [0u8; 32];
+    for i in 0..8 {
+        le[i * 4..i * 4 + 4].copy_from_slice(&candidate[i].to_le_bytes());
     }
+    let mut be = [0u8; 32];
+    for i in 0..32 {
+        be[i] = le[31 - i];
+    }
+    if be.iter().all(|&b| b == 0) {
+        return false;
+    }
+    let sk = match SecretKey::from_slice(&be) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let pk = PublicKey::from_secret_key(secp, &sk);
+    let pkc = pk.serialize();
+    let h160 = hash160(&pkc);
+    if h160 != *target_h160 {
+        return false;
+    }
+    let address = p2pkh_from_pubkey_compressed(&pkc);
+    let wif = wif_from_secret(&sk);
+    println!("FOUND!");
+    println!("address  : {address}");
+    println!("wif      : {wif}");
+    println!("priv_hex : {}", be.encode_hex::<String>());
+    if verbose {
+        println!("pubkey   : {}", pkc.encode_hex::<String>());
+    }
+    true
 }
 
 /* --------------------------- GPU sequence writer -------------------------- */
@@ -202,7 +161,10 @@ struct GpuSeq {
     bind_layout: wgpu::BindGroupLayout,
     out_storage: [wgpu::Buffer; 2],
     readback: [wgpu::Buffer; 2],
+    hits_storage: wgpu::Buffer,
+    hits_readback: wgpu::Buffer,
     capacity: u32,
+    max_hits: u32,
 }
 
 impl GpuSeq {
@@ -228,10 +190,14 @@ impl GpuSeq {
             )
             .await?;
 
-        let shader_src = include_str!("../shaders/seq.wgsl");
+        let shader_src = [
+            include_str!("../shaders/hits.wgsl"),
+            include_str!("../shaders/seq.wgsl"),
+        ]
+        .join("\n");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("seq.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_src)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&shader_src)),
         });
 
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -249,6 +215,16 @@ impl GpuSeq {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -293,6 +269,21 @@ impl GpuSeq {
             })
         });
 
+        let max_hits = 1024u32;
+        let hits_buf_size = ((max_hits + 1) as u64) * 4;
+        let hits_storage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hits_storage"),
+            size: hits_buf_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let hits_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hits_readback"),
+            size: hits_buf_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -300,7 +291,10 @@ impl GpuSeq {
             bind_layout,
             out_storage,
             readback,
+            hits_storage,
+            hits_readback,
             capacity,
+            max_hits,
         })
     }
     fn poll(&self) {
@@ -311,16 +305,31 @@ impl GpuSeq {
         self.readback[idx].unmap();
     }
 
+    #[cfg(test)]
     fn slice(&self, idx: usize, size: u64) -> BufferSlice<'_> {
         self.readback[idx].slice(0..size)
     }
 
+    fn unmap_hits(&self) {
+        self.hits_readback.unmap();
+    }
+
+    fn hits_slice(&self) -> BufferSlice<'_> {
+        let size = ((self.max_hits + 1) as u64) * 4;
+        self.hits_readback.slice(0..size)
+    }
+
+    #[allow(clippy::type_complexity)]
     fn dispatch_and_map(
         &mut self,
         start_le: [u32; 8],
         n: u32,
         idx: usize,
-    ) -> Result<(u64, oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>)> {
+    ) -> Result<(
+        u64,
+        oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    )> {
         let out_u32_len = (n as usize) * 8;
         let out_size_bytes = (out_u32_len * size_of::<u32>()) as u64;
 
@@ -368,6 +377,9 @@ impl GpuSeq {
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             });
 
+        self.queue
+            .write_buffer(&self.hits_storage, 0, bytemuck::cast_slice(&[0u32]));
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bind group"),
             layout: &self.bind_layout,
@@ -379,6 +391,10 @@ impl GpuSeq {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.out_storage[idx].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.hits_storage.as_entire_binding(),
                 },
             ],
         });
@@ -406,22 +422,35 @@ impl GpuSeq {
             0,
             out_size_bytes,
         );
+        let hits_size = ((self.max_hits + 1) as u64) * 4;
+        encoder.copy_buffer_to_buffer(&self.hits_storage, 0, &self.hits_readback, 0, hits_size);
         self.queue.submit(Some(encoder.finish()));
 
         let slice = self.readback[idx].slice(0..out_size_bytes);
-        let (sender, receiver) = oneshot::channel();
+        let hits_slice = self.hits_readback.slice(0..hits_size);
+        let (sender_out, receiver_out) = oneshot::channel();
+        let (sender_hits, receiver_hits) = oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = sender.send(r);
+            let _ = sender_out.send(r);
         });
-        Ok((out_size_bytes, receiver))
+        hits_slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender_hits.send(r);
+        });
+        Ok((out_size_bytes, receiver_out, receiver_hits))
     }
 
     /// Convenience method used in tests to generate a batch synchronously.
     #[cfg(test)]
     async fn generate_seq(&mut self, start_le: [u32; 8], n: u32) -> Result<Vec<u8>> {
-        let (out_size_bytes, recv) = self.dispatch_and_map(start_le, n, 0)?;
+        let (out_size_bytes, out_recv, hits_recv) = self.dispatch_and_map(start_le, n, 0)?;
         self.poll();
-        recv.await.unwrap()?;
+        out_recv.await.unwrap()?;
+        hits_recv.await.unwrap()?;
+        {
+            let slice = self.hits_slice();
+            let _ = slice.get_mapped_range();
+        }
+        self.unmap_hits();
         let mut bytes = vec![0u8; out_size_bytes as usize];
         {
             let slice = self.slice(0, out_size_bytes);
@@ -726,6 +755,14 @@ mod tests {
         let sk = SecretKey::from_slice(&b).unwrap();
         let wif = wif_from_secret(&sk);
         assert_eq!(wif, "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
+    }
+
+    #[test]
+    fn verify_hit_finds_secret_one() {
+        let start = [1u32, 0, 0, 0, 0, 0, 0, 0];
+        let target = decode_p2pkh_to_hash160("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH").expect("addr");
+        let secp = Secp256k1::new();
+        assert!(verify_hit(start, 0, &secp, &target, false));
     }
 
     #[test]

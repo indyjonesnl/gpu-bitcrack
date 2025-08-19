@@ -14,7 +14,7 @@ use wgpu::{BufferUsages, util::DeviceExt};
 
 /// Search for a P2PKH address in a hex keyspace using the GPU to generate candidates.
 #[derive(Parser, Debug)]
-#[command(name = "gpu-keyspace-search")]
+#[command(name = "gpu-bitcrack")]
 #[command(about = "Find a Bitcoin P2PKH address within a private-key hex range using GPU+CPU")]
 struct Args {
     /// Keyspace as START:END in hex (inclusive), e.g. 1000000:1ffffff

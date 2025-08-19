@@ -516,6 +516,134 @@ mod tests {
     use super::*;
     use pollster::block_on;
     use serial_test::file_serial;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn be_to_le_words_converts_correctly() {
+        let mut be = [0u8; 32];
+        for (i, b) in be.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let w = be_to_le_words(&be).expect("convert");
+        assert_eq!(
+            w,
+            [
+                0x1d1e_1f20,
+                0x191a_1b1c,
+                0x1516_1718,
+                0x1112_1314,
+                0x0d0e_0f10,
+                0x090a_0b0c,
+                0x0506_0708,
+                0x0102_0304,
+            ]
+        );
+    }
+
+    #[test]
+    fn hex_to_u256_le_words_handles_basic_cases() {
+        assert_eq!(
+            hex_to_u256_le_words("1").expect("hex"),
+            [1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let words = hex_to_u256_le_words("abc").expect("hex");
+        assert_eq!(words[0], 0x0abc);
+        assert!(words[1..].iter().all(|&w| w == 0));
+    }
+
+    #[test]
+    fn add_small_u256_le_propagates_carry() {
+        let a = [u32::MAX, 0, 0, 0, 0, 0, 0, 0];
+        let r = add_small_u256_le(a, 1);
+        assert_eq!(r, [0, 1, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sub_with_borrow_handles_underflow() {
+        let (r, b) = sub_with_borrow(5, 3, 0);
+        assert_eq!((r, b), (2, 0));
+        let (r2, b2) = sub_with_borrow(3, 5, 0);
+        assert_eq!(r2, u64::MAX - 1);
+        assert_eq!(b2, 1);
+    }
+
+    #[test]
+    fn sub_u256_le_borrow() {
+        let (r, b) = sub_u256_le(&[5, 0, 0, 0, 0, 0, 0, 0], &[3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(r, [2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(b, 0);
+
+        let (r2, b2) = sub_u256_le(&[0; 8], &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(r2, [u32::MAX; 8]);
+        assert_eq!(b2, 1);
+    }
+
+    #[test]
+    fn cmp_u256_le_orders() {
+        let a = [1, 0, 0, 0, 0, 0, 0, 0];
+        let b = [2, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(cmp_u256_le(&a, &b), Ordering::Less);
+        assert_eq!(cmp_u256_le(&b, &a), Ordering::Greater);
+        let a2 = [1, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(cmp_u256_le(&a, &a2), Ordering::Equal);
+    }
+
+    #[test]
+    fn low64_extracts_least_significant_bits() {
+        let x = [0x89ab_cdef, 0x0123_4567, 0, 0, 0, 0, 0, 0];
+        assert_eq!(low64(&x), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn hash160_matches_known_vector() {
+        let h = hash160(b"hello");
+        assert_eq!(
+            h,
+            [
+                0xb6, 0xa9, 0xc8, 0xc2, 0x30, 0x72, 0x2b, 0x7c, 0x74, 0x83, 0x31, 0xa8, 0xb4, 0x50,
+                0xf0, 0x55, 0x66, 0xdc, 0x7d, 0x0f,
+            ]
+        );
+    }
+
+    #[test]
+    fn base58check_encodes_payload() {
+        let payload = [0u8; 21];
+        let s = base58check(&payload);
+        assert_eq!(s, "1111111111111111111114oLvT2");
+    }
+
+    #[test]
+    fn decode_p2pkh_to_hash160_known_address() {
+        let h = decode_p2pkh_to_hash160("1CfZWK1QTQE3eS9qn61dQjV89KDjZzfNcv").unwrap();
+        assert_eq!(
+            h,
+            [
+                0x7f, 0xf4, 0x53, 0x03, 0x77, 0x4e, 0xf7, 0xa5, 0x2f, 0xff, 0xd8, 0x01, 0x19, 0x81,
+                0x03, 0x4b, 0x25, 0x8c, 0xb8, 0x6b,
+            ]
+        );
+    }
+
+    #[test]
+    fn p2pkh_from_pubkey_compressed_known() {
+        let pk_bytes =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&pk_bytes);
+        let addr = p2pkh_from_pubkey_compressed(&pk);
+        assert_eq!(addr, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH");
+    }
+
+    #[test]
+    fn wif_from_secret_known() {
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        let sk = SecretKey::from_slice(&b).unwrap();
+        let wif = wif_from_secret(&sk);
+        assert_eq!(wif, "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
+    }
 
     #[test]
     #[file_serial(gpu)]

@@ -1,6 +1,6 @@
-use rstest::rstest;
 use assert_cmd::Command;
 use predicates::str::contains;
+use rstest::rstest;
 use serial_test::file_serial;
 
 #[rstest]
@@ -28,10 +28,7 @@ use serial_test::file_serial;
 #[file_serial(gpu)] // all tests with the same name run one-at-a-time across binaries
 fn finds_known_address(#[case] range: &str, #[case] target: &str) {
     let mut cmd = Command::cargo_bin("gpu-bitcrack").unwrap();
-    cmd.arg(range)
-        .arg(target)
-        .arg("--batch")
-        .arg("1000000"); // 1 million candidates per GPU dispatch
+    cmd.arg(range).arg(target).arg("--batch").arg("1000000"); // 1 million candidates per GPU dispatch
 
     cmd.assert()
         .success()

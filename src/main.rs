@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Result};
-use bs58;
+use anyhow::{Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use hex::ToHex;
@@ -11,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::mem::size_of;
-use wgpu::{util::DeviceExt, BufferUsages};
+use wgpu::{BufferUsages, util::DeviceExt};
 
 /// Search for a P2PKH address in a hex keyspace using the GPU to generate candidates.
 #[derive(Parser, Debug)]
@@ -50,12 +49,12 @@ fn main() -> Result<()> {
     // Decode target address -> HASH160
     let target_h160 = decode_p2pkh_to_hash160(&args.target)?;
 
-    // GPU init
-    let gpu = block_on(GpuSeq::new())?;
+    // Batch size and GPU init
+    let batch = args.batch.max(1);
+    let mut gpu = block_on(GpuSeq::new(batch))?;
 
     // Scan loop
     let mut cur = start_words;
-    let batch = args.batch.max(1);
     let secp = Secp256k1::new();
 
     loop {
@@ -75,28 +74,26 @@ fn main() -> Result<()> {
         let le_bytes = block_on(gpu.generate_seq(cur, this_batch))?;
 
         // 2) CPU parallel: derive pubkey, hash160, compare to target
-        let pos = le_bytes
-            .par_chunks_exact(32)
-            .position_any(|le32| {
-                // Convert LE 32 bytes -> BE 32 bytes (secp expects big-endian)
-                let mut be = [0u8; 32];
-                for i in 0..32 {
-                    be[i] = le32[31 - i];
-                }
-                // Zero is invalid
-                if be.iter().all(|&b| b == 0) {
-                    return false;
-                }
-                let sk = match SecretKey::from_slice(&be) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                let pk = PublicKey::from_secret_key(&secp, &sk);
-                let pkc = pk.serialize(); // 33 bytes, compressed
+        let pos = le_bytes.par_chunks_exact(32).position_any(|le32| {
+            // Convert LE 32 bytes -> BE 32 bytes (secp expects big-endian)
+            let mut be = [0u8; 32];
+            for i in 0..32 {
+                be[i] = le32[31 - i];
+            }
+            // Zero is invalid
+            if be.iter().all(|&b| b == 0) {
+                return false;
+            }
+            let sk = match SecretKey::from_slice(&be) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let pk = PublicKey::from_secret_key(&secp, &sk);
+            let pkc = pk.serialize(); // 33 bytes, compressed
 
-                let h160 = hash160(&pkc);
-                h160 == target_h160
-            });
+            let h160 = hash160(&pkc);
+            h160 == target_h160
+        });
 
         if let Some(p) = pos {
             // Recreate the winning key and print details
@@ -159,10 +156,13 @@ struct GpuSeq {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
+    out_storage: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    capacity: u32,
 }
 
 impl GpuSeq {
-    async fn new() -> Result<Self> {
+    async fn new(max_batch: u32) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -230,32 +230,53 @@ impl GpuSeq {
             compilation_options: Default::default(),
         });
 
+        let capacity = max_batch.max(1);
+        let buf_size = (capacity as u64) * 32;
+        let out_storage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_storage"),
+            size: buf_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: buf_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             device,
             queue,
             pipeline,
             bind_layout,
+            out_storage,
+            readback,
+            capacity,
         })
     }
 
     /// Generate `n` sequential 256-bit numbers starting at `start_le` (LE words).
-    async fn generate_seq(&self, start_le: [u32; 8], n: u32) -> Result<Vec<u8>> {
+    async fn generate_seq(&mut self, start_le: [u32; 8], n: u32) -> Result<Vec<u8>> {
         let out_u32_len = (n as usize) * 8;
         let out_size_bytes = (out_u32_len * size_of::<u32>()) as u64;
 
-        let out_storage = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("out_storage"),
-            size: out_size_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: out_size_bytes,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        if n > self.capacity {
+            let new_size = (n as u64) * 32;
+            self.out_storage = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("out_storage"),
+                size: new_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: new_size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.capacity = n;
+        }
 
         let params = Params {
             start0: start_le[0],
@@ -290,7 +311,7 @@ impl GpuSeq {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: out_storage.as_entire_binding(),
+                    resource: self.out_storage.as_entire_binding(),
                 },
             ],
         });
@@ -298,7 +319,9 @@ impl GpuSeq {
         // Dispatch
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("encoder"),
+            });
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("seq pass"),
@@ -307,21 +330,21 @@ impl GpuSeq {
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
             const WG: u32 = 256;
-            let groups = (n + (WG - 1)) / WG;
+            let groups = n.div_ceil(WG);
             cpass.dispatch_workgroups(groups, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&out_storage, 0, &readback, 0, out_size_bytes);
+        encoder.copy_buffer_to_buffer(&self.out_storage, 0, &self.readback, 0, out_size_bytes);
         self.queue.submit(Some(encoder.finish()));
 
         // Map + read
-        let slice = readback.slice(..);
+        let slice = self.readback.slice(0..out_size_bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
         let data = slice.get_mapped_range();
         let mut bytes = vec![0u8; out_size_bytes as usize];
         bytes.copy_from_slice(&data);
         drop(data);
-        readback.unmap();
+        self.readback.unmap();
 
         Ok(bytes)
     }
@@ -388,7 +411,10 @@ fn base58check(payload: &[u8]) -> String {
 fn hex_to_u256_le_words(s: &str) -> Result<[u32; 8]> {
     let s = s.trim();
     // strip 0x/0X if present
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     // allow underscores in hex for readability
     let mut s = s.replace('_', "");
 
@@ -439,10 +465,12 @@ fn add_small_u256_le(mut a: [u32; 8], add: u64) -> [u32; 8] {
 
     // propagate any remaining carry (at most 1) upward
     let mut carry = (c1a as u32) + (c1b as u32);
-    for i in 2..8 {
-        if carry == 0 { break; }
-        let (ri, ci) = a[i].overflowing_add(carry);
-        a[i] = ri;
+    for ai in a.iter_mut().skip(2) {
+        if carry == 0 {
+            break;
+        }
+        let (ri, ci) = ai.overflowing_add(carry);
+        *ai = ri;
         carry = ci as u32;
     }
     a
@@ -483,3 +511,20 @@ fn low64(x: &[u32; 8]) -> u64 {
     (x[1] as u64) << 32 | (x[0] as u64)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pollster::block_on;
+    use serial_test::file_serial;
+
+    #[test]
+    #[file_serial(gpu)]
+    #[ignore]
+    fn gpu_seq_resizes() {
+        let mut gpu = block_on(GpuSeq::new(1)).expect("gpu init");
+        let out = block_on(gpu.generate_seq([0; 8], 1)).expect("seq");
+        assert_eq!(out.len(), 32);
+        let out2 = block_on(gpu.generate_seq([0; 8], 2)).expect("seq");
+        assert_eq!(out2.len(), 64);
+    }
+}

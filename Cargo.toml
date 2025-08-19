@@ -1,0 +1,23 @@
+[package]
+name = "gpu-bitcrack"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+wgpu = "0.20"
+pollster = "0.3"
+rayon = "1.10"
+secp256k1 = "0.28"
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = "0.5"
+bytemuck = { version = "1.16", features = ["derive"] }
+hex = "0.4"
+
+[dev-dependencies]
+rstest = "0.21"
+assert_cmd = "2.0"
+predicates = "3.1"
+serial_test = { version = "3", features = ["file_locks"] }

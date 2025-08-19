@@ -274,7 +274,7 @@ impl GpuSeq {
         let hits_storage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hits_storage"),
             size: hits_buf_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let hits_readback = device.create_buffer(&wgpu::BufferDescriptor {

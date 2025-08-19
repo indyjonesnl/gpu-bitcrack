@@ -15,6 +15,7 @@ ripemd = "0.1"
 bs58 = "0.5"
 bytemuck = { version = "1.16", features = ["derive"] }
 hex = "0.4"
+futures = "0.3"
 
 [dev-dependencies]
 rstest = "0.21"

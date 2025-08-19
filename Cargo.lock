@@ -670,6 +670,7 @@ dependencies = [
  "bs58",
  "bytemuck",
  "clap",
+ "futures",
  "hex",
  "pollster",
  "predicates",

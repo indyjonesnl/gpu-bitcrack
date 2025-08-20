@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
 
     steps:
     - uses: actions/checkout@v4
@@ -20,6 +20,6 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
     - name: Tests
-      run: cargo test -j 1 -- --test-threads=1
+      run: cargo test --verbose -j 1 -- --test-threads=1
     - name: Build
       run: cargo build --verbose

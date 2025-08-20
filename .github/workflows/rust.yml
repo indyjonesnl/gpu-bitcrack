@@ -18,12 +18,5 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
-    - name: Install Vulkan dependencies
-      run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
-    - name: Check devices
-      run: vulkaninfo | grep -E 'driverName|deviceType' || true
     - name: Run tests
-      run: |
-        export WGPU_BACKEND=vulkan
-        export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
-        cargo test --verbose -j 1 -- --test-threads=1
+      run: cargo test --verbose

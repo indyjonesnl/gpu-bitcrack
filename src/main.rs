@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::mem::size_of;
+use std::sync::Arc;
 use wgpu::{BufferSlice, BufferUsages, util::DeviceExt};
 
 /// Search for a P2PKH address in a hex keyspace using the GPU to generate candidates.
@@ -56,6 +57,7 @@ async fn run(args: Args) -> Result<()> {
     // Batch size and GPU init
     let batch = args.batch.max(1);
     let mut gpu = GpuSeq::new(batch).await?;
+    let mut sha = GpuSha::new(gpu.device(), gpu.queue(), batch)?;
 
     // Initial batch setup
     let mut cur = start_words;
@@ -90,7 +92,7 @@ async fn run(args: Args) -> Result<()> {
         let (rem, borrow) = sub_u256_le(&end_words, &cur);
         let remaining_u64 = low64(&rem).saturating_add(1);
         if borrow != 0 || remaining_u64 == 0 {
-            if verify_batch(&le_bytes, &secp, &target_h160, args.verbose) {
+            if verify_batch(&le_bytes, &secp, &mut sha, &target_h160, args.verbose) {
                 return Ok(());
             }
             break;
@@ -103,7 +105,7 @@ async fn run(args: Args) -> Result<()> {
         let (next_size, next_recv) = gpu.dispatch_and_map(cur, next_batch, next_idx)?;
 
         // Verify current batch while GPU works on the next
-        if verify_batch(&le_bytes, &secp, &target_h160, args.verbose) {
+        if verify_batch(&le_bytes, &secp, &mut sha, &target_h160, args.verbose) {
             return Ok(());
         }
 
@@ -130,50 +132,64 @@ async fn run(args: Args) -> Result<()> {
 fn verify_batch(
     bytes: &[u8],
     secp: &Secp256k1<secp256k1::All>,
+    gpu_sha: &mut GpuSha,
     target_h160: &[u8; 20],
     verbose: bool,
 ) -> bool {
-    let pos = bytes.par_chunks_exact(32).position_any(|le32| {
-        let mut be = [0u8; 32];
-        for i in 0..32 {
-            be[i] = le32[31 - i];
-        }
-        if be.iter().all(|&b| b == 0) {
-            return false;
-        }
-        let sk = match SecretKey::from_slice(&be) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let pk = PublicKey::from_secret_key(secp, &sk);
-        let pkc = pk.serialize();
-        let h160 = hash160(&pkc);
-        h160 == *target_h160
-    });
+    let items: Vec<([u8; 33], usize)> = bytes
+        .par_chunks_exact(32)
+        .enumerate()
+        .filter_map(|(i, le32)| {
+            let mut be = [0u8; 32];
+            for j in 0..32 {
+                be[j] = le32[31 - j];
+            }
+            if be.iter().all(|&b| b == 0) {
+                return None;
+            }
+            let sk = SecretKey::from_slice(&be).ok()?;
+            let pk = PublicKey::from_secret_key(secp, &sk);
+            Some((pk.serialize(), i))
+        })
+        .collect();
 
-    if let Some(p) = pos {
-        let winner_le = &bytes[p * 32..p * 32 + 32];
-        let mut be = [0u8; 32];
-        for i in 0..32 {
-            be[i] = winner_le[31 - i];
-        }
-        let sk = SecretKey::from_slice(&be).expect("valid secret");
-        let pk = PublicKey::from_secret_key(secp, &sk);
-        let pkc = pk.serialize();
-        let address = p2pkh_from_pubkey_compressed(&pkc);
-        let wif = wif_from_secret(&sk);
-
-        println!("FOUND!");
-        println!("address  : {address}");
-        println!("wif      : {wif}");
-        println!("priv_hex : {}", be.encode_hex::<String>());
-        if verbose {
-            println!("pubkey   : {}", pkc.encode_hex::<String>());
-        }
-        true
-    } else {
-        false
+    if items.is_empty() {
+        return false;
     }
+
+    let (pubkeys, indices): (Vec<[u8; 33]>, Vec<usize>) = items.into_iter().unzip();
+    let digests = match gpu_sha.hash_many(&pubkeys) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    for (digest, idx) in digests.iter().zip(indices.iter()) {
+        let mut rip = Ripemd160::new();
+        rip.update(digest);
+        let out = rip.finalize();
+        if &out[..] == target_h160 {
+            let winner_le = &bytes[idx * 32..idx * 32 + 32];
+            let mut be = [0u8; 32];
+            for i in 0..32 {
+                be[i] = winner_le[31 - i];
+            }
+            let sk = SecretKey::from_slice(&be).expect("valid secret");
+            let pk = PublicKey::from_secret_key(secp, &sk);
+            let pkc = pk.serialize();
+            let address = p2pkh_from_pubkey_compressed(&pkc);
+            let wif = wif_from_secret(&sk);
+
+            println!("FOUND!");
+            println!("address  : {address}");
+            println!("wif      : {wif}");
+            println!("priv_hex : {}", be.encode_hex::<String>());
+            if verbose {
+                println!("pubkey   : {}", pkc.encode_hex::<String>());
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /* --------------------------- GPU sequence writer -------------------------- */
@@ -196,8 +212,8 @@ struct Params {
 }
 
 struct GpuSeq {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
     out_storage: [wgpu::Buffer; 2],
@@ -293,9 +309,12 @@ impl GpuSeq {
             })
         });
 
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
         Ok(Self {
-            device,
-            queue,
+            device: device.clone(),
+            queue: queue.clone(),
             pipeline,
             bind_layout,
             out_storage,
@@ -313,6 +332,14 @@ impl GpuSeq {
 
     fn slice(&self, idx: usize, size: u64) -> BufferSlice<'_> {
         self.readback[idx].slice(0..size)
+    }
+
+    fn device(&self) -> Arc<wgpu::Device> {
+        self.device.clone()
+    }
+
+    fn queue(&self) -> Arc<wgpu::Queue> {
+        self.queue.clone()
     }
 
     fn dispatch_and_map(
@@ -430,6 +457,244 @@ impl GpuSeq {
         }
         self.unmap(0);
         Ok(bytes)
+    }
+}
+
+/* ---------------------------- GPU SHA helper ----------------------------- */
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShaParams {
+    n: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct GpuSha {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::ComputePipeline,
+    bind_layout: wgpu::BindGroupLayout,
+    input: wgpu::Buffer,
+    out_storage: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    capacity: u32,
+}
+
+impl GpuSha {
+    fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, max_items: u32) -> Result<Self> {
+        let shader_src = include_str!("../shaders/sha256.wgsl");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sha256.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_src)),
+        });
+
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sha bind layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sha pipeline layout"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sha pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+
+        let capacity = max_items.max(1);
+        let in_size = (capacity as u64) * 36; // 33 bytes rounded to 36
+        let input = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sha input"),
+            size: in_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_size = (capacity as u64) * 32;
+        let out_storage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sha out"),
+            size: out_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sha readback"),
+            size: out_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_layout,
+            input,
+            out_storage,
+            readback,
+            capacity,
+        })
+    }
+
+    fn poll(&self) {
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
+    fn hash_many(&mut self, pubkeys: &[[u8; 33]]) -> Result<Vec<[u8; 32]>> {
+        let n = pubkeys.len() as u32;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n > self.capacity {
+            let in_size = (n as u64) * 36;
+            self.input = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sha input"),
+                size: in_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let out_size = (n as u64) * 32;
+            self.out_storage = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sha out"),
+                size: out_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sha readback"),
+                size: out_size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.capacity = n;
+        }
+
+        let mut staging = vec![0u8; (n as usize) * 36];
+        for (i, pk) in pubkeys.iter().enumerate() {
+            let off = i * 36;
+            staging[off..off + 33].copy_from_slice(pk);
+        }
+        self.queue
+            .write_buffer(&self.input, 0, &staging[..(n as usize) * 36]);
+
+        let params = ShaParams {
+            n,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sha params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sha bind group"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.out_storage.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sha encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sha pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            const WG: u32 = 64;
+            let groups = n.div_ceil(WG);
+            cpass.dispatch_workgroups(groups, 1, 1);
+        }
+        let out_bytes = (n as u64) * 32;
+        encoder.copy_buffer_to_buffer(&self.out_storage, 0, &self.readback, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.readback.slice(0..out_bytes);
+        let (sender, receiver) = oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender.send(r);
+        });
+        self.poll();
+        block_on(receiver).unwrap()?;
+
+        let data = slice.get_mapped_range();
+        let mut out = vec![[0u8; 32]; n as usize];
+        // GPU writes 32-bit words; bytes arrive in native little-endian order per u32.
+        // Convert each 4-byte word to big-endian so the digest matches standard SHA-256.
+        for i in 0..(n as usize) {
+            let chunk = &data[i * 32..i * 32 + 32];
+            let mut j = 0;
+            while j < 32 {
+                out[i][j] = chunk[j + 3];
+                out[i][j + 1] = chunk[j + 2];
+                out[i][j + 2] = chunk[j + 1];
+                out[i][j + 3] = chunk[j];
+                j += 4;
+            }
+        }
+        drop(data);
+        self.readback.unmap();
+
+        Ok(out)
     }
 }
 
@@ -737,5 +1002,24 @@ mod tests {
         assert_eq!(out.len(), 32);
         let out2 = block_on(gpu.generate_seq([0; 8], 2)).expect("seq");
         assert_eq!(out2.len(), 64);
+    }
+
+    #[test]
+    #[file_serial(gpu)]
+    #[ignore]
+    fn gpu_sha_hashes_pubkeys() {
+        let gpu = block_on(GpuSeq::new(1)).expect("gpu init");
+        let mut sha = GpuSha::new(gpu.device(), gpu.queue(), 1).expect("sha init");
+        let pk_bytes =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&pk_bytes);
+        let dig = sha.hash_many(&[pk]).expect("hash");
+        let mut rip = Ripemd160::new();
+        rip.update(dig[0]);
+        let out = rip.finalize();
+        let h = hash160(&pk);
+        assert_eq!(&out[..], &h[..]);
     }
 }

@@ -155,16 +155,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     a = t1 + t2;
   }
 
-  let digest = array<u32, 8>(
-    a + 0x6a09e667u,
-    b + 0xbb67ae85u,
-    c + 0x3c6ef372u,
-    d + 0xa54ff53au,
-    e + 0x510e527fu,
-    f + 0x9b05688cu,
-    g + 0x1f83d9abu,
-    h + 0x5be0cd19u,
-  );
+  var digest = array<u32, 8>();
+  digest[0] = a + 0x6a09e667u;
+  digest[1] = b + 0xbb67ae85u;
+  digest[2] = c + 0x3c6ef372u;
+  digest[3] = d + 0xa54ff53au;
+  digest[4] = e + 0x510e527fu;
+  digest[5] = f + 0x9b05688cu;
+  digest[6] = g + 0x1f83d9abu;
+  digest[7] = h + 0x5be0cd19u;
 
   for (var i: u32 = 0u; i < 8u; i = i + 1u) {
     let word = digest[i];

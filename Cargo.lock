@@ -672,6 +672,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "naga",
  "pollster",
  "predicates",
  "rayon",

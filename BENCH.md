@@ -116,7 +116,7 @@ Examples:
 
 ```bash
 hyperfine -w 2 -r 7 '
-  ./target/release/gpu-bitcrack 100000:2fffff 1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --batch 1000000
+  ./target/release/gpu-bitcrack 100000:2fffff 1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF --batch 1000000
 '
 ```
 
@@ -136,7 +136,7 @@ Find the sweet spot for your GPU by sweeping `--batch`:
 for b in 262144 524288 750000 1000000 1500000 2000000; do
   echo "Batch=$b"
   hyperfine -w 2 -r 5 "
-    ./target/release/gpu-bitcrack 100000:2fffff 1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --batch $b
+    ./target/release/gpu-bitcrack 100000:2fffff 1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF --batch $b
   "
 done
 ```

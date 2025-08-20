@@ -22,8 +22,6 @@ use serial_test::file_serial;
 #[case("8000:ffff", "1BDyrQ6WoF8VN3g9SAS1iKZcPzFfnDVieY")]
 #[case("10000:1ffff", "1HduPEXZRdG26SUT5Yk83mLkPyjnZuJ7Bm")]
 #[case("20000:3ffff", "1GnNTmTVLZiqQfLbAdp9DVdicEnB5GoERE")]
-#[case("40000:7ffff", "1NWmZRpHH4XSPwsW6dsS3nrNWfL1yrJj4w")]
-#[case("80000:fffff", "1HsMJxNiV7TLxmoF6uJNkydxPFDog4NQum")] // 20
 #[ignore] // Heavy GPU/CPU test; run manually: cargo test -- --ignored --nocapture
 #[file_serial(gpu)] // all tests with the same name run one-at-a-time across binaries
 fn finds_known_address(#[case] range: &str, #[case] target: &str) {

@@ -678,8 +678,18 @@ impl GpuSha {
 
         let data = slice.get_mapped_range();
         let mut out = vec![[0u8; 32]; n as usize];
+        // GPU writes 32-bit words; bytes arrive in native little-endian order per u32.
+        // Convert each 4-byte word to big-endian so the digest matches standard SHA-256.
         for i in 0..(n as usize) {
-            out[i].copy_from_slice(&data[i * 32..i * 32 + 32]);
+            let chunk = &data[i * 32..i * 32 + 32];
+            let mut j = 0;
+            while j < 32 {
+                out[i][j] = chunk[j + 3];
+                out[i][j + 1] = chunk[j + 2];
+                out[i][j + 2] = chunk[j + 1];
+                out[i][j + 3] = chunk[j];
+                j += 4;
+            }
         }
         drop(data);
         self.readback.unmap();

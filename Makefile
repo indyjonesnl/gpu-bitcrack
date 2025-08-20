@@ -1,4 +1,7 @@
-.PHONY: challenge1 challenge1 challenge2 challenge3 challenge4 challenge5 challenge6 challenge7 challenge8 challenge9 challenge10 test10 challenge11 challenge12 challenge13 challenge14 challenge15 challenge16 challenge17 challenge18 challenge19 challenge20 challenge21 challenge22 challenge23 challenge24 challenge25
+.PHONY: test challenge1 challenge1 challenge2 challenge3 challenge4 challenge5 challenge6 challenge7 challenge8 challenge9 challenge10 test10 challenge11 challenge12 challenge13 challenge14 challenge15 challenge16 challenge17 challenge18 challenge19 challenge20 challenge21 challenge22 challenge23 challenge24 challenge25
+
+test:
+	cargo test -j 1 -- --ignored --test-threads=1
 
 challenge1:
 	./target/release/gpu-bitcrack 1:1 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH
@@ -77,4 +80,6 @@ challenge25:
 
 first10: challenge1 challenge2 challenge3 challenge4 challenge5 challenge6 challenge7 challenge8 challenge9 challenge10
 
-first25: first10 challenge11 challenge12 challenge13 challenge14 challenge15 challenge16 challenge17 challenge18 challenge19 challenge20 challenge21 challenge22 challenge23 challenge24 challenge25
+first20: first10 challenge11 challenge12 challenge13 challenge14 challenge15 challenge16 challenge17 challenge18 challenge19 challenge20
+
+first25: first20 challenge21 challenge22 challenge23 challenge24 challenge25

@@ -15,7 +15,7 @@ RANGE_MISS="100000:2fffff"
 TARGET_MISS="1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF"
 RANGE_HIT="200000:3fffff"
 TARGET_HIT="1CfZWK1QTQE3eS9qn61dQjV89KDjZzfNcv"
-BATCHES="550000 60000 650000 700000 750000 800000"
+BATCHES="550000 600000 650000 700000 750000 800000"
 RUNS=7
 WARMUP=2
 OUT_DIR="bench/out/$(date +%Y%m%d-%H%M%S)"
@@ -52,7 +52,7 @@ Options:
 
 Examples:
   bench/sweep.sh --mode hit --batches "262144 524288 1000000"
-  bench/sweep.sh --mode custom --range 01000000:013fffff --target 1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  bench/sweep.sh --mode custom --range 01000000:013fffff --target 1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF
 EOF2
       exit 0;;
     *) echo "Unknown option: $1" >&2; exit 1;;
